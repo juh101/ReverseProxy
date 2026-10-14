@@ -106,5 +106,72 @@ Planned next:
 Do not say planned features are already implemented.
 """
 
+from pathlib import Path
 
+content = """# Bearer Token — Brief Notes
+
+## What is a Bearer Token?
+A bearer token is a credential sent with a request. Whoever possesses a valid token can present it to request access.
+
+Think of it like an event pass:
+- JWT = the pass
+- Gateway = the security guard
+- Backend = the protected area
+
+## How it works in Rev Proxy
+1. Client sends username and password to `POST /auth/login`.
+2. Gateway checks the demo credentials.
+3. If correct, gateway creates a signed JWT and returns it as `access_token`.
+4. Client sends the token with later requests in this header:
+
+   ```http
+   Authorization: Bearer <token>
+   ```
+
+5. Gateway reads the `Authorization` header and separates the scheme (`Bearer`) from the token.
+6. Gateway verifies the JWT signature and expiry using the configured secret and `HS256`.
+7. Valid token → request is forwarded to the backend.
+8. Missing, invalid, or expired token → gateway returns `401 Unauthorized`.
+
+## Important code
+```python
+authorization = request.headers.get(\"Authorization\", \"\")
+scheme, _, token = authorization.partition(\" \")
+```
+- `authorization`: reads the header.
+- `scheme`: should be `Bearer`.
+- `token`: the actual JWT string.
+
+```python
+payload = jwt.decode(
+    token,
+    JWT_SECRET,
+    algorithms=[JWT_ALGORITHM],
+)
+```
+Verifies the token and returns its claims/payload.
+
+## Example Postman setup
+- Login: `POST http://localhost:8002/auth/login`
+- Body → raw → JSON:
+  ```json
+  {
+    \"username\": \"juhi\",
+    \"password\": \"test123\"
+  }
+  ```
+- Copy `access_token` from the response.
+- Protected request: `GET http://localhost:8002/whoami`
+- Authorization tab → **Bearer Token** → paste the token.
+
+## Key points
+- `Bearer` is the authentication scheme; it is not part of the JWT itself.
+- A valid JWT is signed, not encrypted. Do not store passwords or secrets in its payload.
+- A token is a possession-based credential: anyone who steals it may try to use it until it expires.
+- Use HTTPS in production and never commit tokens or real secrets to GitHub.
+- Authentication answers **“Who are you?”**; authorization answers **“What are you allowed to access?”** Role-based authorization is a separate feature we will add later.
+"""
+path = Path("/mnt/data/Bearer_Token_Notes.md")
+path.write_text(content, encoding="utf-8")
+print(f"Created: {path}")
 
