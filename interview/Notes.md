@@ -174,4 +174,3 @@ Verifies the token and returns its claims/payload.
 path = Path("/mnt/data/Bearer_Token_Notes.md")
 path.write_text(content, encoding="utf-8")
 print(f"Created: {path}")
-
