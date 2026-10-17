@@ -8,7 +8,6 @@ app = FastAPI(title="Demo Backend")
 
 BACKEND_NAME = os.getenv("BACKEND_NAME", "backend-1")
 
-
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "backend": BACKEND_NAME}
@@ -26,6 +25,9 @@ async def get_data():
         "backend": BACKEND_NAME,
     }
 
+@app.get("/admin")
+async def admin_dashboard():
+    return {"message": "Ohh wow you are an admin????"}
 
 @app.get("/slow")
 async def slow_response():
