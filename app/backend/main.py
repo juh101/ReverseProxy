@@ -6,7 +6,7 @@ from fastapi import FastAPI
 
 app = FastAPI(title="Demo Backend")
 
-BACKEND_NAME = os.getenv("BACKEND_NAME", "backend-1")
+BACKEND_NAME = os.getenv("BACKEND_NAME", "juhi1")
 
 @app.get("/health")
 async def health_check():

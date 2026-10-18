@@ -13,9 +13,31 @@ from app.gateway.waf import (
     is_bad_path,
     is_suspicious,
 )
+import asyncio
+
 
 # Configuration
-BACKEND_URL = "http://127.0.0.1:8001"
+BACKENDS = [
+    "http://127.0.0.1:8001",
+    "http://127.0.0.1:8003",
+]
+class BackendPool:
+    def __init__(self, backends: list[str]):
+        if not backends:
+            raise ValueError("At least one backend is required")
+
+        self.backends = backends
+        self.index = 0
+        self.lock = asyncio.Lock()
+
+    async def next_backend(self) -> str:
+        async with self.lock:
+            backend = self.backends[self.index]
+            self.index = (self.index + 1) % len(self.backends)
+            return backend
+
+
+backend_pool = BackendPool(BACKENDS)
 
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGORITHM = "HS256"
@@ -35,13 +57,15 @@ class LoginRequest(BaseModel):
 # Create and close the reusable HTTP client
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.client = httpx.AsyncClient(
-        base_url=BACKEND_URL,
-        timeout=10.0,
-    )
-    yield
-    await app.state.client.aclose()
-
+    app.state.clients = {
+        backend: httpx.AsyncClient(timeout=10.0)
+        for backend in BACKENDS
+    }
+    try:
+        yield
+    finally:
+        for client in app.state.clients.values():
+            await client.aclose()
 
 app = FastAPI(title="Mini Security Gateway", lifespan=lifespan)
 rate_limiter = TokenBucketRateLimiter(
@@ -155,10 +179,13 @@ async def admin_dashboard(request: Request):
         )
 
     # 4. Forward the authorized request to the backend
-    client: httpx.AsyncClient = request.app.state.client
+    backend_url = await backend_pool.next_backend()
+    client: httpx.AsyncClient = request.app.state.clients[backend_url]
 
     try:
-        backend_response = await client.get("/admin")
+        backend_response = await client.get(
+            f"{backend_url}/admin"
+        )
     except httpx.TimeoutException:
         return JSONResponse(
             status_code=504,
@@ -184,12 +211,14 @@ async def admin_dashboard(request: Request):
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
 )
 async def forward_request(path: str, request: Request):
+    # 1. Check JWT configuration
     if not JWT_SECRET:
         return JSONResponse(
             status_code=500,
             content={"detail": "JWT_SECRET is not configured"},
         )
 
+    # 2. Extract the Bearer token
     authorization = request.headers.get("Authorization", "")
     scheme, _, token = authorization.partition(" ")
 
@@ -200,22 +229,25 @@ async def forward_request(path: str, request: Request):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # 3. Validate the JWT
     try:
         payload = jwt.decode(
             token,
             JWT_SECRET,
             algorithms=[JWT_ALGORITHM],
         )
+
         if not payload.get("sub"):
             raise jwt.InvalidTokenError("Missing subject")
+
     except jwt.InvalidTokenError:
         return JSONResponse(
             status_code=401,
-            content={"detail": "Invalid or expired token(Login Again pls)"},
+            content={"detail": "Invalid or expired token. Login again."},
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    # Rate limit this client's requests
+
+    # 4. Rate-limit this client's requests
     client_id = (
         request.client.host
         if request.client
@@ -231,17 +263,14 @@ async def forward_request(path: str, request: Request):
             headers={"Retry-After": "10"},
         )
 
-
-    client: httpx.AsyncClient = request.app.state.client
-    
-        # WAF 1: Reject suspicious paths
+    # 5. WAF: Reject suspicious paths
     if is_bad_path(path):
         return JSONResponse(
             status_code=400,
             content={"detail": "Invalid request path"},
         )
 
-    # WAF 2: Early check using Content-Length, if provided
+    # 6. WAF: Early check using Content-Length
     content_length = request.headers.get("content-length")
 
     if content_length is not None:
@@ -257,17 +286,17 @@ async def forward_request(path: str, request: Request):
                 content={"detail": "Invalid Content-Length"},
             )
 
-    # Read the request body
+    # 7. Read the request body
     body = await request.body()
 
-    # WAF 3: Check the actual body size
+    # 8. WAF: Check actual body size
     if len(body) > MAX_BODY_SIZE:
         return JSONResponse(
             status_code=413,
             content={"detail": "Request body too large"},
         )
 
-    # WAF 4: Check query parameters and body for suspicious patterns
+    # 9. WAF: Check query and body for suspicious patterns
     query = request.url.query
     body_text = body.decode("utf-8", errors="ignore")
 
@@ -277,8 +306,7 @@ async def forward_request(path: str, request: Request):
             content={"detail": "Request blocked by WAF"},
         )
 
-    # Do not forward the client's token to the backend
-    
+    # 10. Filter headers before forwarding
     excluded_request_headers = {
         "host",
         "connection",
@@ -299,25 +327,33 @@ async def forward_request(path: str, request: Request):
         if key.lower() not in excluded_request_headers
     }
 
+    # 11. Round-robin: select the next backend
+    backend_url = await backend_pool.next_backend()
+    client: httpx.AsyncClient = request.app.state.clients[backend_url]
+
+    # 12. Forward the request to the selected backend
     try:
         upstream_response = await client.request(
             method=request.method,
-            url="/" + path,
+            url=f"{backend_url}/{path}",
             params=request.query_params,
             content=body,
             headers=forwarded_headers,
         )
+
     except httpx.TimeoutException:
         return JSONResponse(
             status_code=504,
             content={"detail": "Backend request timed out"},
         )
+
     except httpx.RequestError:
         return JSONResponse(
             status_code=502,
             content={"detail": "Could not communicate with backend"},
         )
 
+    # 13. Filter hop-by-hop response headers
     excluded_response_headers = {
         "connection",
         "keep-alive",
@@ -336,6 +372,7 @@ async def forward_request(path: str, request: Request):
         if key.lower() not in excluded_response_headers
     }
 
+    # 14. Return the backend response to the client
     return Response(
         content=upstream_response.content,
         status_code=upstream_response.status_code,
