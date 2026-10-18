@@ -20,24 +20,63 @@ import asyncio
 BACKENDS = [
     "http://127.0.0.1:8001",
     "http://127.0.0.1:8003",
+    "http://127.0.0.1:8004",
+    "http://127.0.0.1:8005",
 ]
+
+
 class BackendPool:
     def __init__(self, backends: list[str]):
         if not backends:
             raise ValueError("At least one backend is required")
 
         self.backends = backends
+        self.healthy_backends: set[str] = set()
         self.index = 0
         self.lock = asyncio.Lock()
 
-    async def next_backend(self) -> str:
+    async def update_health(self, clients: dict):
+        async def check(backend: str):
+            try:
+                response = await clients[backend].get(
+                    f"{backend}/health"
+                )
+                return backend, response.status_code == 200
+            except httpx.RequestError:
+                return backend, False
+
+        results = await asyncio.gather(
+            *(check(backend) for backend in self.backends)
+        )
+
         async with self.lock:
-            backend = self.backends[self.index]
-            self.index = (self.index + 1) % len(self.backends)
-            return backend
+            self.healthy_backends = {
+                backend
+                for backend, healthy in results
+                if healthy
+            }
+
+    async def next_backend(self) -> str | None:
+        async with self.lock:
+            if not self.healthy_backends:
+                return None
+
+            for offset in range(len(self.backends)):
+                position = (self.index + offset) % len(self.backends)
+                backend = self.backends[position]
+
+                if backend in self.healthy_backends:
+                    self.index = (position + 1) % len(self.backends)
+                    return backend
+
+            return None
 
 
 backend_pool = BackendPool(BACKENDS)
+# healthy_backends stores the backends that respond successfully to /health.
+# update_health() checks all four backends.
+# next_backend() skips unhealthy instances.
+# If no healthy backend exists, it returns None.
 
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGORITHM = "HS256"
@@ -53,6 +92,11 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+# Periodically check whether backends are healthy.
+async def health_check_loop(app: FastAPI):
+    while True:
+        await asyncio.sleep(5)
+        await backend_pool.update_health(app.state.clients)
 
 # Create and close the reusable HTTP client
 @asynccontextmanager
@@ -61,15 +105,28 @@ async def lifespan(app: FastAPI):
         backend: httpx.AsyncClient(timeout=10.0)
         for backend in BACKENDS
     }
+
+    # Check backend health immediately at startup.
+    await backend_pool.update_health(app.state.clients)
+
+    health_task = asyncio.create_task(health_check_loop(app))
+
     try:
         yield
     finally:
+        health_task.cancel()
+
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
+
         for client in app.state.clients.values():
             await client.aclose()
 
 app = FastAPI(title="Mini Security Gateway", lifespan=lifespan)
 rate_limiter = TokenBucketRateLimiter(
-    capacity=10,
+    capacity=5,
     refill_interval=10,
 )
 
@@ -179,7 +236,16 @@ async def admin_dashboard(request: Request):
         )
 
     # 4. Forward the authorized request to the backend
+    
+    # Select a healthy backend.
     backend_url = await backend_pool.next_backend()
+
+    if backend_url is None:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "No healthy backends available"},
+        )
+
     client: httpx.AsyncClient = request.app.state.clients[backend_url]
 
     try:
@@ -328,7 +394,16 @@ async def forward_request(path: str, request: Request):
     }
 
     # 11. Round-robin: select the next backend
+    
+    # 11. Select a healthy backend.
     backend_url = await backend_pool.next_backend()
+
+    if backend_url is None:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "No healthy backends available"},
+        )
+
     client: httpx.AsyncClient = request.app.state.clients[backend_url]
 
     # 12. Forward the request to the selected backend
