@@ -366,6 +366,7 @@ async def forward_request(path: str, request: Request):
     query = request.url.query
     body_text = body.decode("utf-8", errors="ignore")
 
+
     if is_suspicious(query) or is_suspicious(body_text):
         return JSONResponse(
             status_code=403,
@@ -393,9 +394,7 @@ async def forward_request(path: str, request: Request):
         if key.lower() not in excluded_request_headers
     }
 
-    # 11. Round-robin: select the next backend
-    
-    # 11. Select a healthy backend.
+    # 11. Select a healthy backend
     backend_url = await backend_pool.next_backend()
 
     if backend_url is None:
@@ -404,28 +403,82 @@ async def forward_request(path: str, request: Request):
             content={"detail": "No healthy backends available"},
         )
 
-    client: httpx.AsyncClient = request.app.state.clients[backend_url]
+    method = request.method.upper()
+    retryable = method in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
 
-    # 12. Forward the request to the selected backend
-    try:
-        upstream_response = await client.request(
-            method=request.method,
-            url=f"{backend_url}/{path}",
-            params=request.query_params,
-            content=body,
-            headers=forwarded_headers,
-        )
+    attempted_backends = set()
+    max_attempts = len(BACKENDS) if retryable else 1
+    had_timeout = False
+    backend_response = None
 
-    except httpx.TimeoutException:
+    for attempt in range(max_attempts):
+        if backend_url in attempted_backends:
+            break
+
+        attempted_backends.add(backend_url)
+
+        # Update client and target URL for the selected backend
+        client: httpx.AsyncClient = request.app.state.clients[backend_url]
+        target_url = f"{backend_url}/{path}"
+
+        try:
+            backend_response = await client.request(
+                method=method,
+                url=target_url,
+                params=request.query_params,
+                content=body,
+                headers=forwarded_headers,
+            )
+
+            # A response was received; do not retry HTTP status codes.
+            break
+
+        except httpx.TimeoutException:
+            had_timeout = True
+
+        except httpx.RequestError:
+            pass
+
+        # 12. Refresh health status after a backend failure
+        await backend_pool.update_health(request.app.state.clients)
+
+        # Exclude attempted backends and select another healthy backend
+        async with backend_pool.lock:
+            backend_pool.healthy_backends.difference_update(
+                attempted_backends
+            )
+
+            backend_url = None
+
+            for offset in range(len(BACKENDS)):
+                position = (
+                    backend_pool.index + offset
+                ) % len(BACKENDS)
+
+                candidate = BACKENDS[position]
+
+                if (
+                    candidate in backend_pool.healthy_backends
+                    and candidate not in attempted_backends
+                ):
+                    backend_url = candidate
+                    backend_pool.index = (
+                        position + 1
+                    ) % len(BACKENDS)
+                    break
+
+        if backend_url is None:
+            break
+
+    # Return an error if no backend responded
+    if backend_response is None:
+        status_code = 504 if had_timeout else 502
+
         return JSONResponse(
-            status_code=504,
-            content={"detail": "Backend request timed out"},
-        )
-
-    except httpx.RequestError:
-        return JSONResponse(
-            status_code=502,
-            content={"detail": "Could not communicate with backend"},
+            status_code=status_code,
+            content={
+                "detail": "All available backend attempts failed"
+            },
         )
 
     # 13. Filter hop-by-hop response headers
@@ -443,13 +496,14 @@ async def forward_request(path: str, request: Request):
 
     response_headers = {
         key: value
-        for key, value in upstream_response.headers.items()
+        for key, value in backend_response.headers.items()
         if key.lower() not in excluded_response_headers
     }
 
     # 14. Return the backend response to the client
     return Response(
-        content=upstream_response.content,
-        status_code=upstream_response.status_code,
+        content=backend_response.content,
+        status_code=backend_response.status_code,
         headers=response_headers,
+        media_type=backend_response.headers.get("content-type"),
     )
