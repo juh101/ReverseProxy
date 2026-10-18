@@ -8,7 +8,11 @@ import jwt
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
-
+from app.gateway.waf import (
+    MAX_BODY_SIZE,
+    is_bad_path,
+    is_suspicious,
+)
 
 # Configuration
 BACKEND_URL = "http://127.0.0.1:8001"
@@ -229,9 +233,52 @@ async def forward_request(path: str, request: Request):
 
 
     client: httpx.AsyncClient = request.app.state.client
+    
+        # WAF 1: Reject suspicious paths
+    if is_bad_path(path):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Invalid request path"},
+        )
+
+    # WAF 2: Early check using Content-Length, if provided
+    content_length = request.headers.get("content-length")
+
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_BODY_SIZE:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body too large"},
+                )
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Invalid Content-Length"},
+            )
+
+    # Read the request body
     body = await request.body()
 
+    # WAF 3: Check the actual body size
+    if len(body) > MAX_BODY_SIZE:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": "Request body too large"},
+        )
+
+    # WAF 4: Check query parameters and body for suspicious patterns
+    query = request.url.query
+    body_text = body.decode("utf-8", errors="ignore")
+
+    if is_suspicious(query) or is_suspicious(body_text):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Request blocked by WAF"},
+        )
+
     # Do not forward the client's token to the backend
+    
     excluded_request_headers = {
         "host",
         "connection",
