@@ -2,7 +2,7 @@
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-
+from app.gateway.rate_limiter import TokenBucketRateLimiter
 import httpx
 import jwt
 from fastapi import FastAPI, Request
@@ -40,7 +40,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Mini Security Gateway", lifespan=lifespan)
-
+rate_limiter = TokenBucketRateLimiter(
+    capacity=10,
+    refill_interval=10,
+)
 
 # 1. Login endpoint
 @app.post("/auth/login")
@@ -97,6 +100,23 @@ async def admin_dashboard(request: Request):
             status_code=500,
             content={"detail": "JWT_SECRET is not configured"},
         )
+    
+    # Rate limit this client's requests
+    client_id = (
+        request.client.host
+        if request.client
+        else "unknown"
+    )
+
+    allowed = await rate_limiter.allow_request(client_id)
+
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Try again later."},
+            headers={"Retry-After": "10"},
+        )
+
 
     # 1. Read the Bearer token
     authorization = request.headers.get("Authorization", "")
@@ -187,9 +207,26 @@ async def forward_request(path: str, request: Request):
     except jwt.InvalidTokenError:
         return JSONResponse(
             status_code=401,
-            content={"detail": "Invalid or expired token"},
+            content={"detail": "Invalid or expired token(Login Again pls)"},
             headers={"WWW-Authenticate": "Bearer"},
         )
+    
+    # Rate limit this client's requests
+    client_id = (
+        request.client.host
+        if request.client
+        else "unknown"
+    )
+
+    allowed = await rate_limiter.allow_request(client_id)
+
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Try again later."},
+            headers={"Retry-After": "10"},
+        )
+
 
     client: httpx.AsyncClient = request.app.state.client
     body = await request.body()
